@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en-us">
+  <head>
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <meta name="author" content="Rasterer" />
+    <meta name="viewport" content="width=device-width"> 
+    <title>Android Binder环 | Rasterer</title>
+	<!-- Jim disable
+	script src="https://google-code-prettify.googlecode.com/svn/loader/run_prettify.js?autoload=true&skin=Desert"></script-->
+    <link href="/feed/" rel="alternate" title="Rasterer" type="application/atom+xml" />
+    <link rel="shortcut icon" href="/favicon.ico"/>
+	<link rel="icon" href="http://rasterer.github.io/favicon.ico"/>
+
+    <link rel="stylesheet" href="/media/css/highlight.css">
+    <link href='/media/webfonts/ss-social.css' rel='stylesheet'>
+    <link href='/media/webfonts/ss-standard.css' rel='stylesheet'>
+
+    <script language="JavaScript"><!--
+        if (navigator.userAgent.match(/iPhone|iPod|Android|IEMobile/i)) {
+            document.write("<link href=\"/media/css/screen-mobil.css\" rel=\"stylesheet\">");
+        } else {
+            document.write("<link href=\"/media/css/screen.css\" rel=\"stylesheet\">");
+        }
+        // -->
+    </script>
+    <!-- Code Highting Support -->
+    <link href="/media/css/prism.css" rel="stylesheet" type="text/css" />
+    <script src="/media/css/prism.js" type="text/javascript"></script>
+    <!--script type="text/javascript" src="/media/js/jquery-1.7.1.min.js"></script-->
+    <script type="text/javascript" src="http://ajax.aspnetcdn.com/ajax/jQuery/jquery-1.7.2.min.js"></script>
+    <!-- LaTeX Support -->
+    <script type="text/javascript" src="http://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML"></script>
+	
+  </head>
+  <body>
+    <div id="container">
+      <div id="main" role="main" style="text-align:justify; text-justify:inter-word">
+        <header>
+        <div class="buttons">
+          <a href="/" class="ss-icon" title="Go to homepage">home</a>
+          <a href="/categories" class="ss-icon" title="Category" >list</a>
+          <a href="/tags" class="ss-icon" title="Tag Cloud" >tags</a>
+          <a href="/guestbook" class="ss-icon" title="Guest Book" >talk</a>
+          <a href="/about" class="ss-icon" title="About" >user</a>
+          <a href="/feed" class="ss-icon" title="Subscribe by RSS" >rss</a>
+        </div>
+        <h1>Android Binder环</h1>
+        </header>
+        <hr>
+        <article class="content">
+        <section class="post">
+<h2>Principle</h2>
+
+<p>上一文中提到了截屏时候BufferQueue的特殊性，即SurfaceFlinger作为IGraphicBufferProduer的Bp端，Bn端则在WMS或Screenshot进程中。SF通过这个Bp代理，就可以实现dequeueBuffer和queueBuffer。但内部的实现却没这么简单。这里要涉及到Android Binder通信的一个特性，作者在此将它命名为Binder环。</p>
+
+<p>要理解Binder环，最好先从Binder的线程模型说起。一般处理事务的线程，会被实现成一个死循环。当有任务请求到来，就被唤醒起来工作。如果所有请求都处理完毕，则会重新进入睡眠状态，等待下一个任务的到来。这就是Binder线程最基本的模型：</p>
+
+<pre><code>void IPCThreadState::joinThreadPool(bool isMain)
+{
+...
+    do {
+        processPendingDerefs();
+        // now get the next command to be processed, waiting if necessary
+        result = getAndExecuteCommand();
+
+        if (result &lt; NO_ERROR &amp;&amp; result != TIMED_OUT &amp;&amp; result != -ECONNREFUSED &amp;&amp; result != -EBADF) {
+            ALOGE("getAndExecuteCommand(fd=%d) returned unexpected error %d, aborting",
+                  mProcess-&gt;mDriverFD, result);
+            abort();
+        }
+
+        // Let this thread exit the thread pool if it is no longer
+        // needed and it is not the main process thread.
+        if(result == TIMED_OUT &amp;&amp; !isMain) {
+            break;
+        }
+    } while (result != -ECONNREFUSED &amp;&amp; result != -EBADF);
+...
+}
+</code></pre>
+
+<p>有了Binder线程以后，当前进程就可以作为一个server开始提供服务。但还有一个问题。如果这个Server需要同时为很多的Clients提供服务，如system_server，那必须保证该Server有一定的吞吐能力。为此引入了Binder线程池的概念。从上面提及的函数名joinThreadPool也可以看出，该函数将自身加入到线程池中，作为一个专门处理Binder请求的线程。线程池中可以有多个Binder线程，可以同时处理多路请求。并且考虑到动态负载，当线程池中的线程耗尽时（都处于工作中），就会spawn一个新的线程（<code>BR_SPAWN_LOOPER</code>)。当然用户可以给一个线程池的最大线程数设定限制。理论上说，当负载降低的时候，应该释放线程池中的线程资源，这是最完美的。但目前Android并未实现此功能。当然这也不是必要的，因为当系统资源不足的时候，lowmemorykiller就经常会拿这些空闲的Binder线程开刀。</p>
+
+<p>有了线程池的概念之后，就可以理解Binder环了。说白了，这是Binder驱动在接收请求时做的一个优化。之所以称之为Binder环，是因为Binder通信不是简单的1:1，当进程A请求B完成某件事的时候，B可能又依赖于C。而在特殊场合下，C又可能依赖于A，所以就构成了一个环状结构。现在抛出了一个问题：当请求回到A的时候，由线程池中哪个Binder线程来负责处理请求？<br/>
+最佳答案是A中最开始发起的Binder线程。</p>
+
+<p><img src="/media/pic/14/binder-thread1.png" alt="Alt text" />
+<img src="/media/pic/14/binder-thread2.png" alt="Alt text" /></p>
+
+<p>因为当请求回到进程A时，可以确定A1线程正在等待之前发送请求的回复，即处于阻塞状态，<br/>
+所以我们可以顺便让A1起来干些别的事情。这种设计主要有两个优点：</p>
+
+<ol>
+<li><p>更高效地利用线程池中的线程，避免不必要的线程增加，节省系统资源。</p></li>
+<li><p>简化程序结构，特别是数据同步/锁保护，随机的Binder线程响应模式可能会增加锁的设计难度。</p></li>
+</ol>
+
+
+<p>Binder驱动实现代码：</p>
+
+<pre><code>void binder_transaction()
+{
+    ...
+    while (tmp) {
+        if (tmp-&gt;from &amp;&amp; tmp-&gt;from-&gt;proc == target_proc)
+            target_thread = tmp-&gt;from;
+        tmp = tmp-&gt;from_parent;
+    }
+
+    ...
+}
+</code></pre>
+
+<h2>Usage Scenario</h2>
+
+<p>在上一文中讨论的SurfaceFlinger截屏的实现中实际上就很巧妙地用到了Binder环。<br/>
+直接引入实现的关键类：</p>
+
+<pre><code>class GraphicProducerWrapper : public BBinder, public MessageHandler {
+</code></pre>
+
+<p>大致的过程是：</p>
+
+<ol>
+<li><p>一个Binder线程收到截屏请求之后，post一个消息让SF主线程处理</p></li>
+<li><p>SF按照上一文的描述，做如下工作：dequeue一块buffer -> 合成 -> queueBuffer</p></li>
+</ol>
+
+
+<p>但是特殊的是在第 1 步中， Binder线程同时创建了一个GraphicProducerWrapper类的实例，并把该对象放到消息里面一起post给了SF。SF在处理dequeueBuffer和queueBuffer的时候，正常情况下会调用一个IGraphicBufferProducer接口的Binder对象。但是我们注意到，GraphicProducerWrapper类正好也继承了BBinder，所以实际上SF主线程操作的是一个BBinder的transact函数，即GraphicProducerWrapper实现的transact函数：</p>
+
+<pre><code>/*
+ * this is called by our "fake" BpGraphicBufferProducer. We package the
+ * data and reply Parcel and forward them to the calling thread.
+ */
+virtual status_t transact(uint32_t code,
+        const Parcel&amp; data, Parcel* reply, uint32_t flags) {
+    this-&gt;code = code;
+    this-&gt;data = &amp;data;
+    this-&gt;reply = reply;
+    android_atomic_acquire_store(0, &amp;memoryBarrier);
+    if (exitPending) {
+        // if we've exited, we run the message synchronously right here
+        handleMessage(Message(MSG_API_CALL));
+    } else {
+        barrier.close();
+        looper-&gt;sendMessage(this, Message(MSG_API_CALL));
+        barrier.wait();
+    }
+    return result;
+}
+</code></pre>
+
+<p>这里做的其实就是发了一个消息给之前的Binder线程，将dequeueBuffer或queueBuffer的请求又转回到该线程中。
+而Binder线程的消息处理函数也呼之欲出：</p>
+
+<pre><code>/*
+ * here we run on the binder calling thread. All we've got to do is
+ * call the real BpGraphicBufferProducer.
+ */
+virtual void handleMessage(const Message&amp; message) {
+    android_atomic_release_load(&amp;memoryBarrier);
+    if (message.what == MSG_API_CALL) {
+        //the transact result needs to be held to let main thread know
+        result = impl-&gt;asBinder()-&gt;transact(code, data[0], reply);
+        barrier.open();
+    } else if (message.what == MSG_EXIT) {
+        exitRequested = true;
+    }
+}
+</code></pre>
+
+<p>这里真正地去做跨进程通信了。</p>
+
+<p>总结一下，就是通过GraphicProducerWrapper在SF主线程的处理流中做了一个HOOK，看似在主线程中做了所有事情，实际上，真正的Binder通信请求又被委派到了最初的Binder线程中。引入这个Wrapper有什么好处呢？没错，就是利用了Binder环。如果用原先接收截屏请求的Binder线程来与请求方通信，那么就会构成一个Binder环，请求方只要再复用之前发CAPTURE_SCREEN请求的线程就可以了。</p>
+
+<p>顺带一提的是，上一段代码在旧版本中有一处bug，即binder通信的结果<font color="red">result</font>并没有保存。如果binder传输失败（对方进程死亡），因为没有正确返回错误码，会导致出现TOMBSTONE。在最新的代码中已被修复。</p>
+
+</section>
+<section class="meta">
+<hr/>
+<!--<span class="author">-->
+  <!--<a href="http://blog.sevenche.com">Rasterer</a> CS undergrad at Columbia University, Java developer intern at Telephoenic, Jordan.-->
+<!--</span>-->
+<br />
+<!--<span class="license">-->
+  <!--Published under <a rel="license" href="http://creativecommons.org/licenses/by-nc-sa/4.0/">(CC) BY-NC-SA</a>-->
+<!--</span>-->
+
+<span class="categories">
+  in categories
+  
+  <a href="/categories/#android" title="android">android</a>&nbsp;
+  
+</span>
+
+
+<span class="tags">
+  tagged with 
+  
+  <a href="/tags/#graphics" title="graphics">graphics</a>&nbsp;
+  
+  <a href="/tags/#binder" title="binder">binder</a>&nbsp;
+  
+</span>
+
+<span class="time">
+  <br/>
+  <time datetime="2014-09-23">2014-09-23</time>
+</span>
+</section>
+<section class="comment">
+<!-- baidu JIA -->
+<div class="bdsharebuttonbox"><a href="#" class="bds_more" data-cmd="more"></a><a title="分享到QQ空间" href="#" class="bds_qzone" data-cmd="qzone"></a><a title="分享到新浪微博" href="#" class="bds_tsina" data-cmd="tsina"></a><a title="分享到腾讯微博" href="#" class="bds_tqq" data-cmd="tqq"></a><a title="分享到人人网" href="#" class="bds_renren" data-cmd="renren"></a><a title="分享到微信" href="#" class="bds_weixin" data-cmd="weixin"></a></div>
+<script>window._bd_share_config={"common":{"bdSnsKey":{},"bdText":"","bdMini":"2","bdMiniList":false,"bdPic":"","bdStyle":"1","bdSize":"16"},"share":{}};with(document)0[(getElementsByTagName('head')[0]||body).appendChild(createElement('script')).src='http://bdimg.share.baidu.com/static/api/js/share.js?v=89860593.js?cdnversion='+~(-new Date()/36e5)];</script>
+<!-- end of baidu JIA -->
+
+<!-- Duoshuo/Disquso Comment BEGIN -->
+<div class="ds-thread"></div>
+<div id="disqus_thread"></div>
+<script type="text/javascript">
+var duoshuoQuery = {short_name:"rasterer"};
+var disqus_shortname = 'rasterer';
+	// Call Duoshuo's function if this page is on githis.com .
+	if(location.host == "rasterer.githis.com")
+	{ 
+		duoshuo();
+	}
+	// Call Disqus's fuction if this page is on github.io .
+	else if (location.host == "rasterer.githsub.io")
+	{
+		disqus();
+	}
+	function duoshuo() // Modified from the universal Duoshuo code
+	{
+		var ds = document.createElement('script');
+		ds.type = 'text/javascript';ds.async = true;
+		ds.src = 'http://static.duoshuo.com/embed.js';
+		ds.charset = 'UTF-8';
+		(document.getElementsByTagName('head')[0] 
+		|| document.getElementsByTagName('body')[0]).appendChild(ds);
+	}
+	function disqus() // Modified from the universal Disqus code
+	{
+		var dsq = document.createElement('script'); dsq.type = 'text/javascript'; dsq.async = true;
+            dsq.src = '//' + disqus_shortname + '.disqus.com/embed.js';
+            (document.getElementsByTagName('head')[0] || document.getElementsByTagName('body')[0]).appendChild(dsq);
+	}
+	</script>
+	<noscript><br>rasterer: Please enable JavaScript to view the comment system.</br>
+	<br>提示：请启用 JavaScript 以显示评论系统</br></noscript>
+<!-- Duoshuo/Disqus Comment END -->
+</section>
+
+
+<script type="text/javascript">
+$(function(){
+  $(document).keydown(function(e) {
+    var url = false;
+        if (e.which == 37 || e.which == 74) {  // Left arrow and J
+            
+        url = 'http://rasterer.github.io/2014/09/Android-Capture-Screen/';
+        
+        }
+        else if (e.which == 39 || e.which == 75) {  // Right arrow and K
+            
+        url = 'http://rasterer.github.io/2014/10/OpenGL%E9%A9%B1%E5%8A%A8%E7%9A%84%E5%BC%82%E6%AD%A5%E6%80%A7/';
+        
+        }
+        if (url) {
+            window.location = url;
+        }
+  });
+})
+
+</script>
+
+<style type="text/css">
+/*resize the big pic*/
+div.resized_image p {
+  margin: 2px;
+  margin-top: 0;
+  font-size: 8px;
+  /* Awesome icon from here: http://www.famfamfam.com/lab/icons/silk/ */
+  background: url(http://i242.photobucket.com/albums/ff244/9861_omikron/error.png) no-repeat;
+  padding-left: 20px;
+  color: #333;
+}
+</style>
+<section class="comment">
+<!-- baidu JIA -->
+<div class="bdsharebuttonbox"><a href="#" class="bds_more" data-cmd="more"></a><a title="分享到QQ空间" href="#" class="bds_qzone" data-cmd="qzone"></a><a title="分享到新浪微博" href="#" class="bds_tsina" data-cmd="tsina"></a><a title="分享到腾讯微博" href="#" class="bds_tqq" data-cmd="tqq"></a><a title="分享到人人网" href="#" class="bds_renren" data-cmd="renren"></a><a title="分享到微信" href="#" class="bds_weixin" data-cmd="weixin"></a></div>
+<script>window._bd_share_config={"common":{"bdSnsKey":{},"bdText":"","bdMini":"2","bdMiniList":false,"bdPic":"","bdStyle":"1","bdSize":"16"},"share":{}};with(document)0[(getElementsByTagName('head')[0]||body).appendChild(createElement('script')).src='http://bdimg.share.baidu.com/static/api/js/share.js?v=89860593.js?cdnversion='+~(-new Date()/36e5)];</script>
+<!-- end of baidu JIA -->
+
+<!-- Duoshuo/Disquso Comment BEGIN -->
+<div class="ds-thread"></div>
+<div id="disqus_thread"></div>
+<script type="text/javascript">
+var duoshuoQuery = {short_name:"rasterer"};
+var disqus_shortname = 'rasterer';
+	// Call Duoshuo's function if this page is on githis.com .
+	if(location.host == "rasterer.githis.com")
+	{ 
+		duoshuo();
+	}
+	// Call Disqus's fuction if this page is on github.io .
+	else if (location.host == "rasterer.githsub.io")
+	{
+		disqus();
+	}
+	function duoshuo() // Modified from the universal Duoshuo code
+	{
+		var ds = document.createElement('script');
+		ds.type = 'text/javascript';ds.async = true;
+		ds.src = 'http://static.duoshuo.com/embed.js';
+		ds.charset = 'UTF-8';
+		(document.getElementsByTagName('head')[0] 
+		|| document.getElementsByTagName('body')[0]).appendChild(ds);
+	}
+	function disqus() // Modified from the universal Disqus code
+	{
+		var dsq = document.createElement('script'); dsq.type = 'text/javascript'; dsq.async = true;
+            dsq.src = '//' + disqus_shortname + '.disqus.com/embed.js';
+            (document.getElementsByTagName('head')[0] || document.getElementsByTagName('body')[0]).appendChild(dsq);
+	}
+	</script>
+	<noscript><br>rasterer: Please enable JavaScript to view the comment system.</br>
+	<br>提示：请启用 JavaScript 以显示评论系统</br></noscript>
+<!-- Duoshuo/Disqus Comment END -->
+</section>
+
+
+    <div id="disqus_thread"></div>
+    <script type="text/javascript">
+        /* * * CONFIGURATION VARIABLES: EDIT BEFORE PASTING INTO YOUR WEBPAGE * * */
+        var disqus_shortname = 'rasterer'; // required: replace example with your forum shortname
+
+        /* * * DON'T EDIT BELOW THIS LINE * * */
+        (function() {
+            var dsq = document.createElement('script'); dsq.type = 'text/javascript'; dsq.async = true;
+            dsq.src = '//' + disqus_shortname + '.disqus.com/embed.js';
+            (document.getElementsByTagName('head')[0] || document.getElementsByTagName('body')[0]).appendChild(dsq);
+        })();
+    </script>
+    <noscript>Please enable JavaScript to view the <a href="http://disqus.com/?ref_noscript">comments powered by Disqus.</a></noscript>
+    
+
+<script type="text/javascript">
+//resize the big pic
+$(window).load(function() {
+  (
+    function(maxht, maxwt, minht, minwt) {
+      var imgs = document.getElementsByTagName('img');
+      // Image resizing function
+      var resize_image = function(img, newht, newwt) {
+        img.height = newht;
+        img.width  = newwt;
+        $(img).wrap('<table><tr><td class="tborder"><div class="resized_image"><a href="' + img.src + '" target="_blank"></a></div></td></tr></table>');
+        $(img).parent().before('<p>NOTE: This image was resized. To view it full-size, click on the image.</p>');
+        //$(img).parent().after('<p style="text-align:right;background:none;margin:0;padding-right:3px">Image resizing script by <a href="http://aetus.net/217/programming/automatically-resize-large-images-with-javascript/">Aetus Designs</a>.</p>');
+      };
+      
+      for (var i = 0; i < imgs.length; i++) {
+        // Set a variable for the current image to make the code make more sense.
+        var img = imgs[i];
+        if (img.height > maxht || img.width > maxwt) {
+          // Use Ratios to constraint proportions.
+          var old_ratio = img.height / img.width;
+          var min_ratio = minht / minwt;
+          // If it can scale perfectly.
+          if (old_ratio === min_ratio) {
+            resize_image(img, minht, minwt);
+          } 
+          // We need to do some magic now.
+          else {
+            var newdim = [img.height, img.width];
+            // Sort out the height first.
+            newdim[0] = minht;
+            // The logic behind this is that if ratio = ht / wt, then wt = ht / ratio.
+            newdim[1] = newdim[0] / old_ratio;
+            // Do we still have to sort out the width?
+            if (newdim[1] > maxwt) {
+              // Just do what we did with the height
+              newdim[1] = minwt;
+              newdim[0] = newdim[1] * old_ratio;
+            }
+            // So yeah, resize the image
+            resize_image(img, newdim[0], newdim[1]);
+          }
+        }
+      }
+    }
+  )(780, 780, 780, 780);
+});
+</script>
+
+        </article>
+      </div>
+
+    <footer>
+        <p style="text-align:center"><small>Powered by <a href="https://github.com/mojombo/jekyll">Jekyll</a> | Hosted by <a href="http://www.githis.com/">Githis</a> and <a href="https://github.com/rasterer">Github</a> | Copyright 2014 - 2014 by <a href="/about/">Rasterer</a> | <span class="label label-info">2014-11-27 16:21:48 CST</span></small></p>
+    </footer>
+
+    </div>
+
+<script>
+  (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+  (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+  m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+  })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+
+  ga('create', 'UA-9695055-3', 'auto');
+  ga('send', 'pageview');
+
+</script>
+  </body>
+</html>

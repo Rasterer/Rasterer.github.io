@@ -1,0 +1,231 @@
+<?xml version="1.0" encoding="utf-8"?>
+  <rss version="2.0"
+        xmlns:content="http://purl.org/rss/1.0/modules/content/"
+        xmlns:atom="http://www.w3.org/2005/Atom"
+  >
+  <channel>
+    <title>Rasterer</title>
+    <link href="http://rasterer.github.io/feed/" rel="self" />
+    <link href="http://geeklu.com" />
+    <lastBuildDate>2014-11-27T16:21:48+08:00</lastBuildDate>
+    <webMaster>kejinlu@gmail.com</webMaster>
+    
+    <item>
+      <title>Opengl驱动的异步性</title>
+      <link href="http://rasterer.github.io/2014/10/OpenGL%E9%A9%B1%E5%8A%A8%E7%9A%84%E5%BC%82%E6%AD%A5%E6%80%A7/"/>
+      <pubDate>2014-10-14T00:00:00+08:00</pubDate>
+      <author>Rasterer</author>
+      <guid>http://rasterer.github.io/2014/10/OpenGL驱动的异步性</guid>
+      <content:encoded><![CDATA[
+]]></content:encoded>
+    </item>
+    
+    <item>
+      <title>Android Binder环</title>
+      <link href="http://rasterer.github.io/2014/09/Android-Binder%E7%8E%AF/"/>
+      <pubDate>2014-09-23T00:00:00+08:00</pubDate>
+      <author>Rasterer</author>
+      <guid>http://rasterer.github.io/2014/09/Android-Binder环</guid>
+      <content:encoded><![CDATA[<h2>Principle</h2>
+
+<p>上一文中提到了截屏时候BufferQueue的特殊性，即SurfaceFlinger作为IGraphicBufferProduer的Bp端，Bn端则在WMS或Screenshot进程中。SF通过这个Bp代理，就可以实现dequeueBuffer和queueBuffer。但内部的实现却没这么简单。这里要涉及到Android Binder通信的一个特性，作者在此将它命名为Binder环。</p>
+
+<p>要理解Binder环，最好先从Binder的线程模型说起。一般处理事务的线程，会被实现成一个死循环。当有任务请求到来，就被唤醒起来工作。如果所有请求都处理完毕，则会重新进入睡眠状态，等待下一个任务的到来。这就是Binder线程最基本的模型：</p>
+
+<pre><code>void IPCThreadState::joinThreadPool(bool isMain)
+{
+...
+    do {
+        processPendingDerefs();
+        // now get the next command to be processed, waiting if necessary
+        result = getAndExecuteCommand();
+
+        if (result &lt; NO_ERROR &amp;&amp; result != TIMED_OUT &amp;&amp; result != -ECONNREFUSED &amp;&amp; result != -EBADF) {
+            ALOGE("getAndExecuteCommand(fd=%d) returned unexpected error %d, aborting",
+                  mProcess-&gt;mDriverFD, result);
+            abort();
+        }
+
+        // Let this thread exit the thread pool if it is no longer
+        // needed and it is not the main process thread.
+        if(result == TIMED_OUT &amp;&amp; !isMain) {
+            break;
+        }
+    } while (result != -ECONNREFUSED &amp;&amp; result != -EBADF);
+...
+}
+</code></pre>
+
+<p>有了Binder线程以后，当前进程就可以作为一个server开始提供服务。但还有一个问题。如果这个Server需要同时为很多的Clients提供服务，如system_server，那必须保证该Server有一定的吞吐能力。为此引入了Binder线程池的概念。从上面提及的函数名joinThreadPool也可以看出，该函数将自身加入到线程池中，作为一个专门处理Binder请求的线程。线程池中可以有多个Binder线程，可以同时处理多路请求。并且考虑到动态负载，当线程池中的线程耗尽时（都处于工作中），就会spawn一个新的线程（<code>BR_SPAWN_LOOPER</code>)。当然用户可以给一个线程池的最大线程数设定限制。理论上说，当负载降低的时候，应该释放线程池中的线程资源，这是最完美的。但目前Android并未实现此功能。当然这也不是必要的，因为当系统资源不足的时候，lowmemorykiller就经常会拿这些空闲的Binder线程开刀。</p>
+
+<p>有了线程池的概念之后，就可以理解Binder环了。说白了，这是Binder驱动在接收请求时做的一个优化。之所以称之为Binder环，是因为Binder通信不是简单的1:1，当进程A请求B完成某件事的时候，B可能又依赖于C。而在特殊场合下，C又可能依赖于A，所以就构成了一个环状结构。现在抛出了一个问题：当请求回到A的时候，由线程池中哪个Binder线程来负责处理请求？<br/>
+最佳答案是A中最开始发起的Binder线程。</p>
+
+<p><img src="/media/pic/14/binder-thread1.png" alt="Alt text" />
+<img src="/media/pic/14/binder-thread2.png" alt="Alt text" /></p>
+
+<p>因为当请求回到进程A时，可以确定A1线程正在等待之前发送请求的回复，即处于阻塞状态，<br/>
+所以我们可以顺便让A1起来干些别的事情。这种设计主要有两个优点：</p>
+
+<ol>
+<li><p>更高效地利用线程池中的线程，避免不必要的线程增加，节省系统资源。</p></li>
+<li><p>简化程序结构，特别是数据同步/锁保护，随机的Binder线程响应模式可能会增加锁的设计难度。</p></li>
+</ol>
+
+
+<p>Binder驱动实现代码：</p>
+
+<pre><code>void binder_transaction()
+{
+    ...
+    while (tmp) {
+        if (tmp-&gt;from &amp;&amp; tmp-&gt;from-&gt;proc == target_proc)
+            target_thread = tmp-&gt;from;
+        tmp = tmp-&gt;from_parent;
+    }
+
+    ...
+}
+</code></pre>
+
+<h2>Usage Scenario</h2>
+
+<p>在上一文中讨论的SurfaceFlinger截屏的实现中实际上就很巧妙地用到了Binder环。<br/>
+直接引入实现的关键类：</p>
+
+<pre><code>class GraphicProducerWrapper : public BBinder, public MessageHandler {
+</code></pre>
+
+<p>大致的过程是：</p>
+
+<ol>
+<li><p>一个Binder线程收到截屏请求之后，post一个消息让SF主线程处理</p></li>
+<li><p>SF按照上一文的描述，做如下工作：dequeue一块buffer -> 合成 -> queueBuffer</p></li>
+</ol>
+
+
+<p>但是特殊的是在第 1 步中， Binder线程同时创建了一个GraphicProducerWrapper类的实例，并把该对象放到消息里面一起post给了SF。SF在处理dequeueBuffer和queueBuffer的时候，正常情况下会调用一个IGraphicBufferProducer接口的Binder对象。但是我们注意到，GraphicProducerWrapper类正好也继承了BBinder，所以实际上SF主线程操作的是一个BBinder的transact函数，即GraphicProducerWrapper实现的transact函数：</p>
+
+<pre><code>/*
+ * this is called by our "fake" BpGraphicBufferProducer. We package the
+ * data and reply Parcel and forward them to the calling thread.
+ */
+virtual status_t transact(uint32_t code,
+        const Parcel&amp; data, Parcel* reply, uint32_t flags) {
+    this-&gt;code = code;
+    this-&gt;data = &amp;data;
+    this-&gt;reply = reply;
+    android_atomic_acquire_store(0, &amp;memoryBarrier);
+    if (exitPending) {
+        // if we've exited, we run the message synchronously right here
+        handleMessage(Message(MSG_API_CALL));
+    } else {
+        barrier.close();
+        looper-&gt;sendMessage(this, Message(MSG_API_CALL));
+        barrier.wait();
+    }
+    return result;
+}
+</code></pre>
+
+<p>这里做的其实就是发了一个消息给之前的Binder线程，将dequeueBuffer或queueBuffer的请求又转回到该线程中。
+而Binder线程的消息处理函数也呼之欲出：</p>
+
+<pre><code>/*
+ * here we run on the binder calling thread. All we've got to do is
+ * call the real BpGraphicBufferProducer.
+ */
+virtual void handleMessage(const Message&amp; message) {
+    android_atomic_release_load(&amp;memoryBarrier);
+    if (message.what == MSG_API_CALL) {
+        //the transact result needs to be held to let main thread know
+        result = impl-&gt;asBinder()-&gt;transact(code, data[0], reply);
+        barrier.open();
+    } else if (message.what == MSG_EXIT) {
+        exitRequested = true;
+    }
+}
+</code></pre>
+
+<p>这里真正地去做跨进程通信了。</p>
+
+<p>总结一下，就是通过GraphicProducerWrapper在SF主线程的处理流中做了一个HOOK，看似在主线程中做了所有事情，实际上，真正的Binder通信请求又被委派到了最初的Binder线程中。引入这个Wrapper有什么好处呢？没错，就是利用了Binder环。如果用原先接收截屏请求的Binder线程来与请求方通信，那么就会构成一个Binder环，请求方只要再复用之前发CAPTURE_SCREEN请求的线程就可以了。</p>
+
+<p>顺带一提的是，上一段代码在旧版本中有一处bug，即binder通信的结果<font color="red">result</font>并没有保存。如果binder传输失败（对方进程死亡），因为没有正确返回错误码，会导致出现TOMBSTONE。在最新的代码中已被修复。</p>
+]]></content:encoded>
+    </item>
+    
+    <item>
+      <title>Android Capture Screen</title>
+      <link href="http://rasterer.github.io/2014/09/Android-Capture-Screen/"/>
+      <pubDate>2014-09-22T00:00:00+08:00</pubDate>
+      <author>Rasterer</author>
+      <guid>http://rasterer.github.io/2014/09/Android-Capture-Screen</guid>
+      <content:encoded><![CDATA[<p>当同时按下POWER键和音量下键的时候，安卓就会产生截屏操作。触发的场景不限于此，按HOME或BACK键退出app，或是发生横竖屏切换的时候，都会触发截屏，只不过此时没有截屏动画。也可以使用以下命令进行截屏。</p>
+
+<pre><code>adb shell screencap -p /sdcard/tmp.png
+</code></pre>
+
+<p>只有系统的图层合成者（composer）才知道当前系统中各个图层（layer）是什么样子，所以截屏工作的主要承担者就是安卓的Composer——SurfaceFlinger（SF）。SF中维护了一个系统的图层集合（layer list)，考虑到某些图层可能是半透明的，所以会将图层按Z序从下到上排好顺序，方便后续合成。SF会把当前所有可见的图层，都通过OpenGL ES合成进一个buffer中。因为是离屏渲染，所以这一步一般是通过framebuffer object(FBO)来实现的。具体的实现很简单，对每个图层来说都画一个矩形，将图层作为一张纹理，即可贴到FBO的目标buffer中。合成完以后，可以用合成的buffer来创建一个新的layer，用来显示截屏动画或是旋转动画，或是简单地保存成一个图片文件。</p>
+
+<p>因为OpenGL是系统无关的，所以Android提供的native buffer不能直接作为render target被GLES使用。幸好，EGL已经提供了办法。利用EGL的API可以将一个本地窗口系统提供的native buffer转换成一个EGLImage，这是EGL用来实现在多种context之间共享资源的途径。利用它，native buffer就可以光明正大的attach到一个FBO上，作为截屏时候的渲染目标。</p>
+
+<p>截屏还有个特殊性。一般情况下，Android BufferQueue的Bp端在APP（生产者），Bn端在SF（消费者）。在截屏场景下却是相反的，因为SF成了生产者。截屏时，screenshot进程或WMS，会发送一个IGraphicBufferProducer的匿名Binder给SF，SF进程正是使用这个Binder，来dequeue一块buffer -> 合成 -> queueBuffer的。具体的细节可参考下一篇——<a href="/2014/09/android-binder%E7%8E%AF/">Android Binder环</a>。</p>
+
+<p>大致的代码过程如下：</p>
+
+<pre><code>result = native_window_dequeue_buffer_and_wait(window,  &amp;buffer);
+...
+
+EGLImageKHR image = eglCreateImageKHR(mEGLDisplay, EGL_NO_CONTEXT,
+    EGL_NATIVE_BUFFER_ANDROID, buffer, NULL);
+...
+
+    glGenTextures(1, &amp;tname);
+    glBindTexture(GL_TEXTURE_2D, tname);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
+
+    // create a Framebuffer Object to render into
+    glGenFramebuffers(1, &amp;name);
+    glBindFramebuffer(GL_FRAMEBUFFER, name);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tname, 0);
+...
+
+        for (size_t i=0 ; i&lt;count ; ++i) {
+            const sp&lt;Layer&gt;&amp; layer(layers[i]);
+            const Layer::State&amp; state(layer-&gt;getDrawingState());
+            if (state.layerStack == hw-&gt;getLayerStack()) {
+                if (state.z &gt;= minLayerZ &amp;&amp; state.z &lt;= maxLayerZ) {
+                    if (layer-&gt;isVisible()) {
+                        if (filtering) layer-&gt;setFiltering(true);
+                        layer-&gt;draw(hw);
+                        if (filtering) layer-&gt;setFiltering(false);
+                    }
+                }
+            }
+        }
+...
+
+EGLSyncKHR sync = eglCreateSyncKHR(mEGLDisplay, EGL_SYNC_FENCE_KHR, NULL);
+if (sync != EGL_NO_SYNC_KHR) {
+    EGLint result = eglClientWaitSyncKHR(mEGLDisplay, sync, //等待合成完成
+        EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, 2000000000 /*2 sec*/);
+...
+
+window-&gt;queueBuffer(window, buffer, -1);
+</code></pre>
+]]></content:encoded>
+    </item>
+    
+    <item>
+      <title>Hello Zhebin</title>
+      <link href="http://rasterer.github.io/2014/09/Hello-Zhebin/"/>
+      <pubDate>2014-09-20T00:00:00+08:00</pubDate>
+      <author>Rasterer</author>
+      <guid>http://rasterer.github.io/2014/09/Hello-Zhebin</guid>
+      <content:encoded><![CDATA[
+]]></content:encoded>
+    </item>
+    
+  </channel>
+</rss>
