@@ -1,9 +1,9 @@
-highlighter: pygments
-markdown: redcarpet
+markdown: rdiscount
 permalink: /:year/:month/:title/
 url: http://rasterer.github.io
 author: Rasterer
 email: Jzhebin@gmail.com
 github: Rasterer
+highlighter: true
 paginate: 24
 about: "I am a GFXer"
