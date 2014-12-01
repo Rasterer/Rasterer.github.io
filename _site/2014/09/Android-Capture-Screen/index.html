@@ -48,61 +48,58 @@
         </header>
         <hr>
         <article class="content">
-        <section class="post">
+        <link rel="stylesheet" href="/css/pygments.css">
+<section class="post">
 <p>当同时按下POWER键和音量下键的时候，安卓就会产生截屏操作。触发的场景不限于此，按HOME或BACK键退出app，或是发生横竖屏切换的时候，都会触发截屏，只不过此时没有截屏动画。也可以使用以下命令进行截屏。</p>
-
-<pre><code>adb shell screencap -p /sdcard/tmp.png
-</code></pre>
-
+<div class="highlight"><pre><code class="language-text" data-lang="text">adb shell screencap -p /sdcard/tmp.png
+</code></pre></div>
 <p>只有系统的图层合成者（composer）才知道当前系统中各个图层（layer）是什么样子，所以截屏工作的主要承担者就是安卓的Composer——SurfaceFlinger（SF）。SF中维护了一个系统的图层集合（layer list)，考虑到某些图层可能是半透明的，所以会将图层按Z序从下到上排好顺序，方便后续合成。SF会把当前所有可见的图层，都通过OpenGL ES合成进一个buffer中。因为是离屏渲染，所以这一步一般是通过framebuffer object(FBO)来实现的。具体的实现很简单，对每个图层来说都画一个矩形，将图层作为一张纹理，即可贴到FBO的目标buffer中。合成完以后，可以用合成的buffer来创建一个新的layer，用来显示截屏动画或是旋转动画，或是简单地保存成一个图片文件。</p>
 
 <p>因为OpenGL是系统无关的，所以Android提供的native buffer不能直接作为render target被GLES使用。幸好，EGL已经提供了办法。利用EGL的API可以将一个本地窗口系统提供的native buffer转换成一个EGLImage，这是EGL用来实现在多种context之间共享资源的途径。利用它，native buffer就可以光明正大的attach到一个FBO上，作为截屏时候的渲染目标。</p>
 
-<p>截屏还有个特殊性。一般情况下，Android BufferQueue的Bp端在APP（生产者），Bn端在SF（消费者）。在截屏场景下却是相反的，因为SF成了生产者。截屏时，screenshot进程或WMS，会发送一个IGraphicBufferProducer的匿名Binder给SF，SF进程正是使用这个Binder，来dequeue一块buffer -> 合成 -> queueBuffer的。具体的细节可参考下一篇——<a href="/2014/09/android-binder%E7%8E%AF/">Android Binder环</a>。</p>
+<p>截屏还有个特殊性。一般情况下，Android BufferQueue的Bp端在APP（生产者），Bn端在SF（消费者）。在截屏场景下却是相反的，因为SF成了生产者。截屏时，screenshot进程或WMS，会发送一个IGraphicBufferProducer的匿名Binder给SF，SF进程正是使用这个Binder，来dequeue一块buffer -&gt; 合成 -&gt; queueBuffer的。具体的细节可参考下一篇——<a href="/2014/09/android-binder%E7%8E%AF/">Android Binder环</a>。</p>
 
 <p>大致的代码过程如下：</p>
+<div class="highlight"><pre><code class="language-C" data-lang="C"><span class="n">result</span> <span class="o">=</span> <span class="n">native_window_dequeue_buffer_and_wait</span><span class="p">(</span><span class="n">window</span><span class="p">,</span>  <span class="o">&amp;</span><span class="n">buffer</span><span class="p">);</span>
+<span class="p">...</span>
 
-<pre><code>result = native_window_dequeue_buffer_and_wait(window,  &amp;buffer);
-...
+<span class="n">EGLImageKHR</span> <span class="n">image</span> <span class="o">=</span> <span class="n">eglCreateImageKHR</span><span class="p">(</span><span class="n">mEGLDisplay</span><span class="p">,</span> <span class="n">EGL_NO_CONTEXT</span><span class="p">,</span>
+    <span class="n">EGL_NATIVE_BUFFER_ANDROID</span><span class="p">,</span> <span class="n">buffer</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+<span class="p">...</span>
 
-EGLImageKHR image = eglCreateImageKHR(mEGLDisplay, EGL_NO_CONTEXT,
-    EGL_NATIVE_BUFFER_ANDROID, buffer, NULL);
-...
+    <span class="n">glGenTextures</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tname</span><span class="p">);</span>
+    <span class="n">glBindTexture</span><span class="p">(</span><span class="n">GL_TEXTURE_2D</span><span class="p">,</span> <span class="n">tname</span><span class="p">);</span>
+    <span class="n">glEGLImageTargetTexture2DOES</span><span class="p">(</span><span class="n">GL_TEXTURE_2D</span><span class="p">,</span> <span class="p">(</span><span class="n">GLeglImageOES</span><span class="p">)</span><span class="n">image</span><span class="p">);</span>
 
-    glGenTextures(1, &amp;tname);
-    glBindTexture(GL_TEXTURE_2D, tname);
-    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
+    <span class="c1">// create a Framebuffer Object to render into</span>
+    <span class="n">glGenFramebuffers</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">name</span><span class="p">);</span>
+    <span class="n">glBindFramebuffer</span><span class="p">(</span><span class="n">GL_FRAMEBUFFER</span><span class="p">,</span> <span class="n">name</span><span class="p">);</span>
+    <span class="n">glFramebufferTexture2D</span><span class="p">(</span><span class="n">GL_FRAMEBUFFER</span><span class="p">,</span> <span class="n">GL_COLOR_ATTACHMENT0</span><span class="p">,</span> <span class="n">GL_TEXTURE_2D</span><span class="p">,</span> <span class="n">tname</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+<span class="p">...</span>
 
-    // create a Framebuffer Object to render into
-    glGenFramebuffers(1, &amp;name);
-    glBindFramebuffer(GL_FRAMEBUFFER, name);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tname, 0);
-...
+        <span class="k">for</span> <span class="p">(</span><span class="kt">size_t</span> <span class="n">i</span><span class="o">=</span><span class="mi">0</span> <span class="p">;</span> <span class="n">i</span><span class="o">&lt;</span><span class="n">count</span> <span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+            <span class="k">const</span> <span class="n">sp</span><span class="o">&lt;</span><span class="n">Layer</span><span class="o">&gt;&amp;</span> <span class="n">layer</span><span class="p">(</span><span class="n">layers</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+            <span class="k">const</span> <span class="n">Layer</span><span class="o">::</span><span class="n">State</span><span class="o">&amp;</span> <span class="n">state</span><span class="p">(</span><span class="n">layer</span><span class="o">-&gt;</span><span class="n">getDrawingState</span><span class="p">());</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">state</span><span class="p">.</span><span class="n">layerStack</span> <span class="o">==</span> <span class="n">hw</span><span class="o">-&gt;</span><span class="n">getLayerStack</span><span class="p">())</span> <span class="p">{</span>
+                <span class="k">if</span> <span class="p">(</span><span class="n">state</span><span class="p">.</span><span class="n">z</span> <span class="o">&gt;=</span> <span class="n">minLayerZ</span> <span class="o">&amp;&amp;</span> <span class="n">state</span><span class="p">.</span><span class="n">z</span> <span class="o">&lt;=</span> <span class="n">maxLayerZ</span><span class="p">)</span> <span class="p">{</span>
+                    <span class="k">if</span> <span class="p">(</span><span class="n">layer</span><span class="o">-&gt;</span><span class="n">isVisible</span><span class="p">())</span> <span class="p">{</span>
+                        <span class="k">if</span> <span class="p">(</span><span class="n">filtering</span><span class="p">)</span> <span class="n">layer</span><span class="o">-&gt;</span><span class="n">setFiltering</span><span class="p">(</span><span class="nb">true</span><span class="p">);</span>
+                        <span class="n">layer</span><span class="o">-&gt;</span><span class="n">draw</span><span class="p">(</span><span class="n">hw</span><span class="p">);</span>
+                        <span class="k">if</span> <span class="p">(</span><span class="n">filtering</span><span class="p">)</span> <span class="n">layer</span><span class="o">-&gt;</span><span class="n">setFiltering</span><span class="p">(</span><span class="nb">false</span><span class="p">);</span>
+                    <span class="p">}</span>
+                <span class="p">}</span>
+            <span class="p">}</span>
+        <span class="p">}</span>
+<span class="p">...</span>
 
-        for (size_t i=0 ; i&lt;count ; ++i) {
-            const sp&lt;Layer&gt;&amp; layer(layers[i]);
-            const Layer::State&amp; state(layer-&gt;getDrawingState());
-            if (state.layerStack == hw-&gt;getLayerStack()) {
-                if (state.z &gt;= minLayerZ &amp;&amp; state.z &lt;= maxLayerZ) {
-                    if (layer-&gt;isVisible()) {
-                        if (filtering) layer-&gt;setFiltering(true);
-                        layer-&gt;draw(hw);
-                        if (filtering) layer-&gt;setFiltering(false);
-                    }
-                }
-            }
-        }
-...
+<span class="n">EGLSyncKHR</span> <span class="n">sync</span> <span class="o">=</span> <span class="n">eglCreateSyncKHR</span><span class="p">(</span><span class="n">mEGLDisplay</span><span class="p">,</span> <span class="n">EGL_SYNC_FENCE_KHR</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">);</span>
+<span class="k">if</span> <span class="p">(</span><span class="n">sync</span> <span class="o">!=</span> <span class="n">EGL_NO_SYNC_KHR</span><span class="p">)</span> <span class="p">{</span>
+    <span class="n">EGLint</span> <span class="n">result</span> <span class="o">=</span> <span class="n">eglClientWaitSyncKHR</span><span class="p">(</span><span class="n">mEGLDisplay</span><span class="p">,</span> <span class="n">sync</span><span class="p">,</span> <span class="c1">//等待合成完成</span>
+        <span class="n">EGL_SYNC_FLUSH_COMMANDS_BIT_KHR</span><span class="p">,</span> <span class="mi">2000000000</span> <span class="cm">/*2 sec*/</span><span class="p">);</span>
+<span class="p">...</span>
 
-EGLSyncKHR sync = eglCreateSyncKHR(mEGLDisplay, EGL_SYNC_FENCE_KHR, NULL);
-if (sync != EGL_NO_SYNC_KHR) {
-    EGLint result = eglClientWaitSyncKHR(mEGLDisplay, sync, //等待合成完成
-        EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, 2000000000 /*2 sec*/);
-...
-
-window-&gt;queueBuffer(window, buffer, -1);
-</code></pre>
-
+<span class="n">window</span><span class="o">-&gt;</span><span class="n">queueBuffer</span><span class="p">(</span><span class="n">window</span><span class="p">,</span> <span class="n">buffer</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">);</span>
+</code></pre></div>
 </section>
 <section class="meta">
 <hr/>
@@ -328,7 +325,7 @@ $(window).load(function() {
       </div>
 
     <footer>
-        <p style="text-align:center"><small>Powered by <a href="https://github.com/mojombo/jekyll">Jekyll</a> | Hosted by <a href="http://www.githis.com/">Githis</a> and <a href="https://github.com/rasterer">Github</a> | Copyright 2014 - 2014 by <a href="/about/">Rasterer</a> | <span class="label label-info">2014-11-27 16:21:48 CST</span></small></p>
+        <p style="text-align:center"><small>Powered by <a href="https://github.com/mojombo/jekyll">Jekyll</a> | Hosted by <a href="http://www.githis.com/">Githis</a> and <a href="https://github.com/rasterer">Github</a> | Copyright 2014 - 2014 by <a href="/about/">Rasterer</a> | <span class="label label-info">2014-12-01 21:25:14 CST</span></small></p>
     </footer>
 
     </div>
