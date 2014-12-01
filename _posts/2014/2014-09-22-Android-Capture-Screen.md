@@ -25,7 +25,7 @@ adb shell screencap -p /sdcard/tmp.png
 
 大致的代码过程如下：
 
-```C
+{% highlight c++ %}
 result = native_window_dequeue_buffer_and_wait(window,  &buffer);
 ...
 
@@ -65,5 +65,5 @@ if (sync != EGL_NO_SYNC_KHR) {
 ...
 
 window->queueBuffer(window, buffer, -1);
-```
+{% endhighlight %}
 

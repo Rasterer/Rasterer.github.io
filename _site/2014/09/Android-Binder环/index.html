@@ -49,71 +49,72 @@
         <hr>
         <article class="content">
         <section class="post">
-<h2>Principle</h2>
+<h2 id="principle">Principle</h2>
 
 <p>上一文中提到了截屏时候BufferQueue的特殊性，即SurfaceFlinger作为IGraphicBufferProduer的Bp端，Bn端则在WMS或Screenshot进程中。SF通过这个Bp代理，就可以实现dequeueBuffer和queueBuffer。但内部的实现却没这么简单。这里要涉及到Android Binder通信的一个特性，作者在此将它命名为Binder环。</p>
 
 <p>要理解Binder环，最好先从Binder的线程模型说起。一般处理事务的线程，会被实现成一个死循环。当有任务请求到来，就被唤醒起来工作。如果所有请求都处理完毕，则会重新进入睡眠状态，等待下一个任务的到来。这就是Binder线程最基本的模型：</p>
 
-<pre><code>void IPCThreadState::joinThreadPool(bool isMain)
-{
-...
-    do {
-        processPendingDerefs();
-        // now get the next command to be processed, waiting if necessary
-        result = getAndExecuteCommand();
+<div class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="kt">void</span> <span class="n">IPCThreadState</span><span class="o">::</span><span class="n">joinThreadPool</span><span class="p">(</span><span class="kt">bool</span> <span class="n">isMain</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="p">...</span>
+    <span class="k">do</span> <span class="p">{</span>
+        <span class="n">processPendingDerefs</span><span class="p">();</span>
+        <span class="c1">// now get the next command to be processed, waiting if necessary</span>
+        <span class="n">result</span> <span class="o">=</span> <span class="n">getAndExecuteCommand</span><span class="p">();</span>
 
-        if (result &lt; NO_ERROR &amp;&amp; result != TIMED_OUT &amp;&amp; result != -ECONNREFUSED &amp;&amp; result != -EBADF) {
-            ALOGE("getAndExecuteCommand(fd=%d) returned unexpected error %d, aborting",
-                  mProcess-&gt;mDriverFD, result);
-            abort();
-        }
-
-        // Let this thread exit the thread pool if it is no longer
-        // needed and it is not the main process thread.
-        if(result == TIMED_OUT &amp;&amp; !isMain) {
-            break;
-        }
-    } while (result != -ECONNREFUSED &amp;&amp; result != -EBADF);
-...
-}
-</code></pre>
+        <span class="k">if</span> <span class="p">(</span><span class="n">result</span> <span class="o">&lt;</span> <span class="n">NO_ERROR</span> <span class="o">&amp;&amp;</span> <span class="n">result</span> <span class="o">!=</span> <span class="n">TIMED_OUT</span> <span class="o">&amp;&amp;</span> <span class="n">result</span> <span class="o">!=</span> <span class="o">-</span><span class="n">ECONNREFUSED</span> <span class="o">&amp;&amp;</span> <span class="n">result</span> <span class="o">!=</span> <span class="o">-</span><span class="n">EBADF</span><span class="p">)</span> <span class="p">{</span>
+            <span class="n">ALOGE</span><span class="p">(</span><span class="s">&quot;getAndExecuteCommand(fd=%d) returned unexpected error %d, aborting&quot;</span><span class="p">,</span>
+                  <span class="n">mProcess</span><span class="o">-&gt;</span><span class="n">mDriverFD</span><span class="p">,</span> <span class="n">result</span><span class="p">);</span>
+            <span class="n">abort</span><span class="p">();</span>
+        <span class="p">}</span>
+        
+        <span class="c1">// Let this thread exit the thread pool if it is no longer</span>
+        <span class="c1">// needed and it is not the main process thread.</span>
+        <span class="k">if</span><span class="p">(</span><span class="n">result</span> <span class="o">==</span> <span class="n">TIMED_OUT</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">isMain</span><span class="p">)</span> <span class="p">{</span>
+            <span class="k">break</span><span class="p">;</span>
+        <span class="p">}</span>
+    <span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">result</span> <span class="o">!=</span> <span class="o">-</span><span class="n">ECONNREFUSED</span> <span class="o">&amp;&amp;</span> <span class="n">result</span> <span class="o">!=</span> <span class="o">-</span><span class="n">EBADF</span><span class="p">);</span>
+<span class="p">...</span>
+<span class="p">}</span></code></pre></div>
 
 <p>有了Binder线程以后，当前进程就可以作为一个server开始提供服务。但还有一个问题。如果这个Server需要同时为很多的Clients提供服务，如system_server，那必须保证该Server有一定的吞吐能力。为此引入了Binder线程池的概念。从上面提及的函数名joinThreadPool也可以看出，该函数将自身加入到线程池中，作为一个专门处理Binder请求的线程。线程池中可以有多个Binder线程，可以同时处理多路请求。并且考虑到动态负载，当线程池中的线程耗尽时（都处于工作中），就会spawn一个新的线程（<code>BR_SPAWN_LOOPER</code>)。当然用户可以给一个线程池的最大线程数设定限制。理论上说，当负载降低的时候，应该释放线程池中的线程资源，这是最完美的。但目前Android并未实现此功能。当然这也不是必要的，因为当系统资源不足的时候，lowmemorykiller就经常会拿这些空闲的Binder线程开刀。</p>
 
-<p>有了线程池的概念之后，就可以理解Binder环了。说白了，这是Binder驱动在接收请求时做的一个优化。之所以称之为Binder环，是因为Binder通信不是简单的1:1，当进程A请求B完成某件事的时候，B可能又依赖于C。而在特殊场合下，C又可能依赖于A，所以就构成了一个环状结构。现在抛出了一个问题：当请求回到A的时候，由线程池中哪个Binder线程来负责处理请求？<br/>
+<p>有了线程池的概念之后，就可以理解Binder环了。说白了，这是Binder驱动在接收请求时做的一个优化。之所以称之为Binder环，是因为Binder通信不是简单的1:1，当进程A请求B完成某件事的时候，B可能又依赖于C。而在特殊场合下，C又可能依赖于A，所以就构成了一个环状结构。现在抛出了一个问题：当请求回到A的时候，由线程池中哪个Binder线程来负责处理请求？<br />
 最佳答案是A中最开始发起的Binder线程。</p>
 
 <p><img src="/media/pic/14/binder-thread1.png" alt="Alt text" />
 <img src="/media/pic/14/binder-thread2.png" alt="Alt text" /></p>
 
-<p>因为当请求回到进程A时，可以确定A1线程正在等待之前发送请求的回复，即处于阻塞状态，<br/>
+<p>因为当请求回到进程A时，可以确定A1线程正在等待之前发送请求的回复，即处于阻塞状态，<br />
 所以我们可以顺便让A1起来干些别的事情。这种设计主要有两个优点：</p>
 
 <ol>
-<li><p>更高效地利用线程池中的线程，避免不必要的线程增加，节省系统资源。</p></li>
-<li><p>简化程序结构，特别是数据同步/锁保护，随机的Binder线程响应模式可能会增加锁的设计难度。</p></li>
+  <li>
+    <p>更高效地利用线程池中的线程，避免不必要的线程增加，节省系统资源。</p>
+  </li>
+  <li>
+    <p>简化程序结构，特别是数据同步/锁保护，随机的Binder线程响应模式可能会增加锁的设计难度。</p>
+  </li>
 </ol>
-
 
 <p>Binder驱动实现代码：</p>
 
-<pre><code>void binder_transaction()
-{
-    ...
-    while (tmp) {
-        if (tmp-&gt;from &amp;&amp; tmp-&gt;from-&gt;proc == target_proc)
-            target_thread = tmp-&gt;from;
-        tmp = tmp-&gt;from_parent;
-    }
+<div class="highlight"><pre><code class="language-c" data-lang="c"><span class="kt">void</span> <span class="nf">binder_transaction</span><span class="p">()</span>
+<span class="p">{</span>
+	<span class="p">...</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">tmp</span><span class="p">)</span> <span class="p">{</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">tmp</span><span class="o">-&gt;</span><span class="n">from</span> <span class="o">&amp;&amp;</span> <span class="n">tmp</span><span class="o">-&gt;</span><span class="n">from</span><span class="o">-&gt;</span><span class="n">proc</span> <span class="o">==</span> <span class="n">target_proc</span><span class="p">)</span>
+			<span class="n">target_thread</span> <span class="o">=</span> <span class="n">tmp</span><span class="o">-&gt;</span><span class="n">from</span><span class="p">;</span>
+		<span class="n">tmp</span> <span class="o">=</span> <span class="n">tmp</span><span class="o">-&gt;</span><span class="n">from_parent</span><span class="p">;</span>
+	<span class="p">}</span>
 
-    ...
-}
-</code></pre>
+	<span class="p">...</span>
+<span class="p">}</span></code></pre></div>
 
-<h2>Usage Scenario</h2>
+<h2 id="usage-scenario">Usage Scenario</h2>
 
-<p>在上一文中讨论的SurfaceFlinger截屏的实现中实际上就很巧妙地用到了Binder环。<br/>
+<p>在上一文中讨论的SurfaceFlinger截屏的实现中实际上就很巧妙地用到了Binder环。<br />
 直接引入实现的关键类：</p>
 
 <pre><code>class GraphicProducerWrapper : public BBinder, public MessageHandler {
@@ -122,53 +123,54 @@
 <p>大致的过程是：</p>
 
 <ol>
-<li><p>一个Binder线程收到截屏请求之后，post一个消息让SF主线程处理</p></li>
-<li><p>SF按照上一文的描述，做如下工作：dequeue一块buffer -> 合成 -> queueBuffer</p></li>
+  <li>
+    <p>一个Binder线程收到截屏请求之后，post一个消息让SF主线程处理</p>
+  </li>
+  <li>
+    <p>SF按照上一文的描述，做如下工作：dequeue一块buffer -&gt; 合成 -&gt; queueBuffer</p>
+  </li>
 </ol>
-
 
 <p>但是特殊的是在第 1 步中， Binder线程同时创建了一个GraphicProducerWrapper类的实例，并把该对象放到消息里面一起post给了SF。SF在处理dequeueBuffer和queueBuffer的时候，正常情况下会调用一个IGraphicBufferProducer接口的Binder对象。但是我们注意到，GraphicProducerWrapper类正好也继承了BBinder，所以实际上SF主线程操作的是一个BBinder的transact函数，即GraphicProducerWrapper实现的transact函数：</p>
 
-<pre><code>/*
- * this is called by our "fake" BpGraphicBufferProducer. We package the
- * data and reply Parcel and forward them to the calling thread.
- */
-virtual status_t transact(uint32_t code,
-        const Parcel&amp; data, Parcel* reply, uint32_t flags) {
-    this-&gt;code = code;
-    this-&gt;data = &amp;data;
-    this-&gt;reply = reply;
-    android_atomic_acquire_store(0, &amp;memoryBarrier);
-    if (exitPending) {
-        // if we've exited, we run the message synchronously right here
-        handleMessage(Message(MSG_API_CALL));
-    } else {
-        barrier.close();
-        looper-&gt;sendMessage(this, Message(MSG_API_CALL));
-        barrier.wait();
-    }
-    return result;
-}
-</code></pre>
+<div class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="cm">/*</span>
+<span class="cm">     * this is called by our &quot;fake&quot; BpGraphicBufferProducer. We package the</span>
+<span class="cm">     * data and reply Parcel and forward them to the calling thread.</span>
+<span class="cm">     */</span>
+    <span class="k">virtual</span> <span class="kt">status_t</span> <span class="nf">transact</span><span class="p">(</span><span class="kt">uint32_t</span> <span class="n">code</span><span class="p">,</span>
+            <span class="k">const</span> <span class="n">Parcel</span><span class="o">&amp;</span> <span class="n">data</span><span class="p">,</span> <span class="n">Parcel</span><span class="o">*</span> <span class="n">reply</span><span class="p">,</span> <span class="kt">uint32_t</span> <span class="n">flags</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">this</span><span class="o">-&gt;</span><span class="n">code</span> <span class="o">=</span> <span class="n">code</span><span class="p">;</span>
+        <span class="k">this</span><span class="o">-&gt;</span><span class="n">data</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">data</span><span class="p">;</span>
+        <span class="k">this</span><span class="o">-&gt;</span><span class="n">reply</span> <span class="o">=</span> <span class="n">reply</span><span class="p">;</span>
+        <span class="n">android_atomic_acquire_store</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">memoryBarrier</span><span class="p">);</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">exitPending</span><span class="p">)</span> <span class="p">{</span>
+            <span class="c1">// if we&#39;ve exited, we run the message synchronously right here</span>
+            <span class="n">handleMessage</span><span class="p">(</span><span class="n">Message</span><span class="p">(</span><span class="n">MSG_API_CALL</span><span class="p">));</span>
+        <span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+            <span class="n">barrier</span><span class="p">.</span><span class="n">close</span><span class="p">();</span>
+            <span class="n">looper</span><span class="o">-&gt;</span><span class="n">sendMessage</span><span class="p">(</span><span class="k">this</span><span class="p">,</span> <span class="n">Message</span><span class="p">(</span><span class="n">MSG_API_CALL</span><span class="p">));</span>
+            <span class="n">barrier</span><span class="p">.</span><span class="n">wait</span><span class="p">();</span>
+        <span class="p">}</span>
+        <span class="k">return</span> <span class="n">result</span><span class="p">;</span>
+    <span class="p">}</span></code></pre></div>
 
 <p>这里做的其实就是发了一个消息给之前的Binder线程，将dequeueBuffer或queueBuffer的请求又转回到该线程中。
 而Binder线程的消息处理函数也呼之欲出：</p>
 
-<pre><code>/*
- * here we run on the binder calling thread. All we've got to do is
- * call the real BpGraphicBufferProducer.
- */
-virtual void handleMessage(const Message&amp; message) {
-    android_atomic_release_load(&amp;memoryBarrier);
-    if (message.what == MSG_API_CALL) {
-        //the transact result needs to be held to let main thread know
-        result = impl-&gt;asBinder()-&gt;transact(code, data[0], reply);
-        barrier.open();
-    } else if (message.what == MSG_EXIT) {
-        exitRequested = true;
-    }
-}
-</code></pre>
+<div class="highlight"><pre><code class="language-c--" data-lang="c++"><span class="cm">/*</span>
+<span class="cm">	 * here we run on the binder calling thread. All we&#39;ve got to do is</span>
+<span class="cm">	 * call the real BpGraphicBufferProducer.</span>
+<span class="cm">	 */</span>
+    <span class="k">virtual</span> <span class="kt">void</span> <span class="nf">handleMessage</span><span class="p">(</span><span class="k">const</span> <span class="n">Message</span><span class="o">&amp;</span> <span class="n">message</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">android_atomic_release_load</span><span class="p">(</span><span class="o">&amp;</span><span class="n">memoryBarrier</span><span class="p">);</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">message</span><span class="p">.</span><span class="n">what</span> <span class="o">==</span> <span class="n">MSG_API_CALL</span><span class="p">)</span> <span class="p">{</span>
+            <span class="c1">//the transact result needs to be held to let main thread know</span>
+            <span class="n">result</span> <span class="o">=</span> <span class="n">impl</span><span class="o">-&gt;</span><span class="n">asBinder</span><span class="p">()</span><span class="o">-&gt;</span><span class="n">transact</span><span class="p">(</span><span class="n">code</span><span class="p">,</span> <span class="n">data</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">reply</span><span class="p">);</span>
+            <span class="n">barrier</span><span class="p">.</span><span class="n">open</span><span class="p">();</span>
+        <span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">message</span><span class="p">.</span><span class="n">what</span> <span class="o">==</span> <span class="n">MSG_EXIT</span><span class="p">)</span> <span class="p">{</span>
+            <span class="n">exitRequested</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+        <span class="p">}</span>
+    <span class="p">}</span></code></pre></div>
 
 <p>这里真正地去做跨进程通信了。</p>
 
@@ -399,7 +401,7 @@ $(window).load(function() {
       </div>
 
     <footer>
-        <p style="text-align:center"><small>Powered by <a href="https://github.com/mojombo/jekyll">Jekyll</a> | Hosted by <a href="http://www.githis.com/">Githis</a> and <a href="https://github.com/rasterer">Github</a> | Copyright 2014 - 2014 by <a href="/about/">Rasterer</a> | <span class="label label-info">2014-11-27 16:21:48 CST</span></small></p>
+        <p style="text-align:center"><small>Powered by <a href="https://github.com/mojombo/jekyll">Jekyll</a> | Hosted by <a href="http://www.githis.com/">Githis</a> and <a href="https://github.com/rasterer">Github</a> | Copyright 2014 - 2014 by <a href="/about/">Rasterer</a> | <span class="label label-info">2014-12-01 23:33:04 CST</span></small></p>
     </footer>
 
     </div>

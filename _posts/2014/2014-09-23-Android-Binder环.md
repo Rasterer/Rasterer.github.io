@@ -15,7 +15,7 @@ tags:
 
 要理解Binder环，最好先从Binder的线程模型说起。一般处理事务的线程，会被实现成一个死循环。当有任务请求到来，就被唤醒起来工作。如果所有请求都处理完毕，则会重新进入睡眠状态，等待下一个任务的到来。这就是Binder线程最基本的模型：
 
-~~~
+{% highlight c++ %}
 void IPCThreadState::joinThreadPool(bool isMain)
 {
 ...
@@ -38,7 +38,7 @@ void IPCThreadState::joinThreadPool(bool isMain)
     } while (result != -ECONNREFUSED && result != -EBADF);
 ...
 }
-~~~
+{% endhighlight %}
 
 有了Binder线程以后，当前进程就可以作为一个server开始提供服务。但还有一个问题。如果这个Server需要同时为很多的Clients提供服务，如system_server，那必须保证该Server有一定的吞吐能力。为此引入了Binder线程池的概念。从上面提及的函数名joinThreadPool也可以看出，该函数将自身加入到线程池中，作为一个专门处理Binder请求的线程。线程池中可以有多个Binder线程，可以同时处理多路请求。并且考虑到动态负载，当线程池中的线程耗尽时（都处于工作中），就会spawn一个新的线程（`BR_SPAWN_LOOPER`)。当然用户可以给一个线程池的最大线程数设定限制。理论上说，当负载降低的时候，应该释放线程池中的线程资源，这是最完美的。但目前Android并未实现此功能。当然这也不是必要的，因为当系统资源不足的时候，lowmemorykiller就经常会拿这些空闲的Binder线程开刀。
 
@@ -57,7 +57,7 @@ void IPCThreadState::joinThreadPool(bool isMain)
 
 Binder驱动实现代码：
 
-~~~
+{% highlight c %}
 void binder_transaction()
 {
 	...
@@ -69,7 +69,7 @@ void binder_transaction()
 
 	...
 }
-~~~
+{% endhighlight %}
 
 ##Usage Scenario
 
@@ -86,7 +86,7 @@ void binder_transaction()
 
 但是特殊的是在第 1 步中， Binder线程同时创建了一个GraphicProducerWrapper类的实例，并把该对象放到消息里面一起post给了SF。SF在处理dequeueBuffer和queueBuffer的时候，正常情况下会调用一个IGraphicBufferProducer接口的Binder对象。但是我们注意到，GraphicProducerWrapper类正好也继承了BBinder，所以实际上SF主线程操作的是一个BBinder的transact函数，即GraphicProducerWrapper实现的transact函数：
 
-
+{% highlight c++ %}
     /*
      * this is called by our "fake" BpGraphicBufferProducer. We package the
      * data and reply Parcel and forward them to the calling thread.
@@ -107,12 +107,13 @@ void binder_transaction()
         }
         return result;
     }
+{% endhighlight %}
 
 
 这里做的其实就是发了一个消息给之前的Binder线程，将dequeueBuffer或queueBuffer的请求又转回到该线程中。
 而Binder线程的消息处理函数也呼之欲出：
 
-
+{% highlight c++ %}
 	/*
 	 * here we run on the binder calling thread. All we've got to do is
 	 * call the real BpGraphicBufferProducer.
@@ -127,6 +128,7 @@ void binder_transaction()
             exitRequested = true;
         }
     }
+{% endhighlight %}
 
 
 这里真正地去做跨进程通信了。
