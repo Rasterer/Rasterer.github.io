@@ -21,7 +21,7 @@ adb shell screencap -p /sdcard/tmp.png
 
 因为OpenGL是系统无关的，所以Android提供的native buffer不能直接作为render target被GLES使用。幸好，EGL已经提供了办法。利用EGL的API可以将一个本地窗口系统提供的native buffer转换成一个EGLImage，这是EGL用来实现在多种context之间共享资源的途径。利用它，native buffer就可以光明正大的attach到一个FBO上，作为截屏时候的渲染目标。
 
-截屏还有个特殊性。一般情况下，Android BufferQueue的Bp端在APP（生产者），Bn端在SF（消费者）。在截屏场景下却是相反的，因为SF成了生产者。截屏时，screenshot进程或WMS，会发送一个IGraphicBufferProducer的匿名Binder给SF，SF进程正是使用这个Binder，来dequeue一块buffer -> 合成 -> queueBuffer的。具体的细节可参考下一篇——[Android Binder环](/2014/09/android-binder环/)。
+截屏还有个特殊性。一般情况下，Android BufferQueue的Bp端在APP（生产者），Bn端在SF（消费者）。在截屏场景下却是相反的，因为SF成了生产者。截屏时，screenshot进程或WMS，会发送一个IGraphicBufferProducer的匿名Binder给SF，SF进程正是使用这个Binder，来dequeue一块buffer -> 合成 -> queueBuffer的。具体的细节可参考下一篇——[Android Binder环](/2014/09/Android-Binder环/)。
 
 大致的代码过程如下：
 
