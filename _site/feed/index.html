@@ -7,16 +7,67 @@
     <title>Rasterer</title>
     <link href="http://rasterer.github.io/feed/" rel="self" />
     <link href="http://geeklu.com" />
-    <lastBuildDate>2014-12-22T18:53:03+08:00</lastBuildDate>
+    <lastBuildDate>2015-02-26T13:26:02+08:00</lastBuildDate>
     <webMaster>kejinlu@gmail.com</webMaster>
     
     <item>
-      <title>Opengl驱动的异步性</title>
+      <title>OpenGL驱动的异步性</title>
       <link href="http://rasterer.github.io/2014/10/OpenGL%E9%A9%B1%E5%8A%A8%E7%9A%84%E5%BC%82%E6%AD%A5%E6%80%A7/"/>
       <pubDate>2014-10-14T00:00:00+08:00</pubDate>
       <author>Rasterer</author>
       <guid>http://rasterer.github.io/2014/10/OpenGL驱动的异步性</guid>
-      <content:encoded><![CDATA[
+      <content:encoded><![CDATA[<h3 id="sync-or-async">Sync or Async</h3>
+
+<p>GPU虽然是以并行计算出名，但其更基础的架构仍然是一套pipeline。与CPU类似，GPU也拥有很长的pipeline， 但基本上可以划分为 
+两个大的阶段：几何(Geometry)和光栅化(Rasterization)。使用Pipeline的优点是，可以将一个大的工作，分成好几个阶段 
+每个阶段可以同时执行。理论上N级的流水线能将效率最大提升N倍。例如，当一部分图元在进行光栅化操作时，一些新的图元已经开始进入 
+几何阶段进行处理。从而保证pipeline的各个阶段都处于忙碌之中。套用这个观点，其实可以把GPU命令的准备阶段（运行在CPU上， 
+包括app和gfx driver）也看成整个3D Pipeline的一部分。所谓图形驱动的异步性，就是使CPU和GPU同时忙碌起来，GPU在处理 
+上一批命令，而CPU正在准备下一批命令，从而提高系统并行度。</p>
+
+<p><img src="/media/pic/14/gles_driver1.png" alt="Alt text" /></p>
+
+<h3 id="fence">Fence</h3>
+
+<p><img src="/media/pic/14/gles_driver2.png" alt="Alt text" /></p>
+
+<p>异步性虽然增加了系统整体的并行度，但也使图形驱动的实现变得更见困难和复杂，因为我们需要一种机制，能够保证资源访问的互斥， 
+并能查询某些资源在GPU端的使用状态。比如一张texture如果刚刚用于draw，紧接着对其调用glTexImage2D，驱动必须保证， 
+对这张texture的修改是在上一次的draw完成以后。在硬件层面，GPU可以在命令流中插入一些所谓的Fence命令，保证只有在Fence的条件
+满足之后，才能执行接下来的命令。而在该段命令流完成之后，GPU则会更新一些状态（往往是内存中的一些计数单元），这些命令可以称为Update命令。 
+有了这种硬件支持，client端的驱动就有能力协调好各种buffer的访问同步了。一段命令流大致的执行阶段如下：</p>
+
+<p>一般来说，驱动会负责维护好资源之间的同步，用户不必担心。但OpenGL和EGL也提供了一种叫sync objects的对象，可以用上述的Fence/Update
+将GPU上命令的执行状态暴露给用户，以用来做更灵活的处理（比如用户想显示等待渲染完成）。一个sync刚创建时处于unsignaled状态。
+当插入到命令流中被GPU执行过以后，就变成了signaled状态。</p>
+
+<h3 id="android-native-fence">Android Native Fence</h3>
+<p>以上是描述一个render context的情形。当某些Buffer需要在多个context之间传输时，这种异步性又如何体现呢？在现如今的Android
+或者Linux桌面平台上，都有所谓的系统合成者（SurfaceFlinger/DRI2）的存在。即APP渲染一块buffer之后，把这块buffer传给 
+合成者，由合成者负责合成所有的图层，并把结果显示到屏幕上。一种简单的实现方法是，APP等待自己的渲染命令完成，确保buffer已经 
+被填入正确的内容，然后再传给合成者。但这显然不是一种高效率的实现。假设APP下命令的时间为t1，而GPU渲染的时间为t2，则合成者 
+至少要等到t1 + t2之后，才能开始下相关的合成命令，假设所需的时间是t3，则GPU至少要等到t1 + t2 + t3之后，才能真正处理合成 
+命令。而我们希望合成者在t1 ~ t2之间就能发出合成命令，GPU在APP端的渲染完成之后（t1 + t2），就能立刻处理合成命令。同理， 
+APP的渲染一般要等到合成者用完buffer，重新传回给APP端之后才能进行。但最完美的结果是，APP端可以提前可以下命令，在GPU处理完 
+合成命令后，就立刻处理下一帧的渲染命令。在这种生产者和消费者的环形工作模型下，CPU一直领先GPU几拍，两者始终忙碌于各自的工作。 
+对于系统渲染负载较高的情况，这种模型尤为有利！</p>
+
+<p>安卓为了实现这套模型，引入了Android native fence对象。考虑到APP和Composer处于不同进程，所以这个对象的首要能力就是能 
+跨进程传输，所以native fence是用一个fd来表示的，可以用Binder进行传输，就跟native buffer一样。安卓又引入了一个叫
+Fence的类，这个类是用来作引用计数的，唯一的成员变量就是一个fd。这个fd在kernel层对应一个叫struct fence的结构体。 
+另外还有两个重要的结构体叫做sync_timeline和sync_pt。 
+三者的介绍如下。</p>
+
+<p>sync_timeline：
+A sync_timeline is a monotonically increasing timeline that should be implemented for each driver instance, such as a GL context, display controller, or 2D blitter. This is essentially a counter of jobs submitted to the kernel for a particular piece of hardware. It provides guarantees about the order of operations and allows hardware-specific implementations.</p>
+
+<p>sync_pt：
+A sync_pt is a single value or point on a sync_timeline. A point has three states: active, signaled, and error. Points start in the active state and transition to the signaled or error states. For instance, when a buffer is no longer needed by an image consumer, this sync_point is signaled so that image producers know it is okay to write into the buffer again.</p>
+
+<p>sync_fence：
+A sync_fence is a collection of sync_pts that often have different sync_timeline parents (such as for the display controller and GPU). These are the main primitives over which drivers and userspace communicate their dependencies. A fence is a promise from the kernel that it gives upon accepting work that has been queued and assures completion in a finite amount of time.</p>
+
+<h3 id="tbd">TBD</h3>
 ]]></content:encoded>
     </item>
     
@@ -172,7 +223,7 @@
 
 <p>因为OpenGL是系统无关的，所以Android提供的native buffer不能直接作为render target被GLES使用。幸好，EGL已经提供了办法。利用EGL的API可以将一个本地窗口系统提供的native buffer转换成一个EGLImage，这是EGL用来实现在多种context之间共享资源的途径。利用它，native buffer就可以光明正大的attach到一个FBO上，作为截屏时候的渲染目标。</p>
 
-<p>截屏还有个特殊性。一般情况下，Android BufferQueue的Bp端在APP（生产者），Bn端在SF（消费者）。在截屏场景下却是相反的，因为SF成了生产者。截屏时，screenshot进程或WMS，会发送一个IGraphicBufferProducer的匿名Binder给SF，SF进程正是使用这个Binder，来dequeue一块buffer -&gt; 合成 -&gt; queueBuffer的。具体的细节可参考下一篇——<a href="/2014/09/android-binder环/">Android Binder环</a>。</p>
+<p>截屏还有个特殊性。一般情况下，Android BufferQueue的Bp端在APP（生产者），Bn端在SF（消费者）。在截屏场景下却是相反的，因为SF成了生产者。截屏时，screenshot进程或WMS，会发送一个IGraphicBufferProducer的匿名Binder给SF，SF进程正是使用这个Binder，来dequeue一块buffer -&gt; 合成 -&gt; queueBuffer的。具体的细节可参考下一篇——<a href="/2014/09/Android-Binder环/">Android Binder环</a>。</p>
 
 <p>大致的代码过程如下：</p>
 
